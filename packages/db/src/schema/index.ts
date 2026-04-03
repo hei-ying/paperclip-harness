@@ -34,7 +34,7 @@ export { issueComments } from "./issue_comments.js";
 export { issueInboxArchives } from "./issue_inbox_archives.js";
 export { feedbackVotes } from "./feedback_votes.js";
 export { feedbackExports } from "./feedback_exports.js";
-export { specPackages, specFiles, specIssues, specDODChecklist } from "./spec_packages.js";
+export { specPackages, specFiles, specIssues, specDODChecklist, SPEC_FILE_TEMPLATES, DOD_ITEMS } from "./spec_packages.js";
 export { issueReadStates } from "./issue_read_states.js";
 export { assets } from "./assets.js";
 export { issueAttachments } from "./issue_attachments.js";

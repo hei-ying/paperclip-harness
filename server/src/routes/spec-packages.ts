@@ -1,75 +1,34 @@
 /**
- * 渠道对接规范包 API 路由
+ * 渠道对接规范包 API 路由（数据库版）
  *
- * 提供规范包 CRUD、GATE 检查、AI Agent 约束注入等 API。
+ * 使用 Drizzle ORM 操作 spec_packages / spec_files / spec_issues / spec_dod_checklist 表。
  */
 
-import { Router } from "express";
-import { randomUUID } from "crypto";
-
-// 类型定义（实际项目中从 schema 导入）
-interface SpecPackage {
-  id: string;
-  companyId: string;
-  projectId: string;
-  version: number;
-  status: string;
-  gate1Status: string;
-  gate2Status: string;
-  gate3Status: string;
-  gate1Result: any;
-  gate2Result: any;
-  gate3Result: any;
-  approvedByUserId: string | null;
-  approvedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface SpecFile {
-  id: string;
-  specPackageId: string;
-  companyId: string;
-  templateType: string;
-  fileName: string;
-  content: string | null;
-  fileStatus: string;
-  priority: number;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface SpecIssue {
-  id: string;
-  specPackageId: string;
-  companyId: string;
-  issueType: string;
-  source: string;
-  severity: string;
-  relatedFiles: string[] | null;
-  title: string;
-  description: string | null;
-  suggestion: string | null;
-  resolution: string | null;
-  resolutionNote: string | null;
-  resolvedByUserId: string | null;
-  resolvedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-// 内存存储（生产环境替换为数据库）
-const specPackages = new Map<string, SpecPackage>();
-const specFiles = new Map<string, SpecFile>();
-const specIssues = new Map<string, SpecIssue>();
+import { Router, type Request } from "express";
+import type { Db } from "@paperclipai/db";
+import { desc, eq, and } from "drizzle-orm";
+import { assertCompanyAccess } from "./authz.js";
+import {
+  specPackages,
+  specFiles,
+  specIssues,
+  specDODChecklist,
+  DOD_ITEMS,
+} from "@paperclipai/db";
+import type { GateCheckResult } from "../services/spec-gate-service-types.js";
+import {
+  runGate1Check,
+  runGate2RuleCheck,
+  runGate3Check,
+  generateAgentCodingPrompt,
+} from "../services/spec-gate-service.js";
 
 // ── 规范包文件模板 ──
 const SPEC_TEMPLATES = [
   {
-    templateType: "glossary",
+    templateType: "glossary" as const,
     fileName: "00-glossary.md",
     priority: 3,
-    label: "统一术语规范",
     template: `# Glossary — 统一术语规范
 
 > 所有业务术语、渠道术语、字段语义必须以本文件为准。
@@ -84,13 +43,11 @@ const SPEC_TEMPLATES = [
 `,
   },
   {
-    templateType: "openapi",
+    templateType: "openapi" as const,
     fileName: "01-openapi.yaml",
     priority: 1,
-    label: "接口契约",
     template: `# 接口契约 — 01-openapi.yaml
 # ⚠️ 此文件为外部契约，不得在实现阶段擅自修改
-# 若发现与渠道官方文档冲突，应进入问题处理流程
 
 openapi: "3.0.3"
 info:
@@ -100,10 +57,9 @@ paths: {}
 `,
   },
   {
-    templateType: "flow",
+    templateType: "flow" as const,
     fileName: "02-flow.md",
     priority: 4,
-    label: "业务流程规范",
     template: `# 业务流程规范 — 02-flow.md
 
 ## 主流程
@@ -114,16 +70,12 @@ paths: {}
 
 ## 状态机
 （描述状态变化）
-
-## 流程图
-（可使用 mermaid 或文字描述）
 `,
   },
   {
-    templateType: "scenarios",
+    templateType: "scenarios" as const,
     fileName: "03-scenarios.md",
     priority: 5,
-    label: "关键场景与异常处理",
     template: `# 关键场景与异常处理 — 03-scenarios.md
 
 ## 必须覆盖的场景
@@ -133,46 +85,33 @@ paths: {}
 - [ ] 渠道成功但本地落库失败
 - [ ] 网络超时但渠道实际成功
 - [ ] 同一错误码在不同接口语义不同
-
-## 异常场景
-（详细描述每个异常场景的预期处理方式）
 `,
   },
   {
-    templateType: "runtime_rules",
+    templateType: "runtime_rules" as const,
     fileName: "04-runtime-rules.md",
     priority: 6,
-    label: "运行时规则",
     template: `# 运行时规则 — 04-runtime-rules.md
 
 ## Timeout 策略
 - 连接超时: ____
 - 读取超时: ____
-- 总超时: ____
 
 ## Retry Policy
 - 重试次数: ____
 - 重试间隔: ____
-- 重试条件: ____
 
 ## Idempotency
 - 幂等 Key 规则: ____
 
-## Rate Limit
-- 限流策略: ____
-
 ## 日志脱敏
 - 脱敏字段清单: ____
-
-## 人工补偿条件
-- ____
 `,
   },
   {
-    templateType: "observability",
+    templateType: "observability" as const,
     fileName: "05-observability.md",
     priority: 7,
-    label: "可观测性规范",
     template: `# 可观测性规范 — 05-observability.md
 
 ## Trace
@@ -187,388 +126,402 @@ paths: {}
 
 ## 告警条件
 - ____
-
-## 重放/补偿支持
-- ____
 `,
   },
   {
-    templateType: "testcases",
+    templateType: "testcases" as const,
     fileName: "06-testcases.md",
     priority: 8,
-    label: "测试策略",
     template: `# 测试策略 — 06-testcases.md
 
 ## 单元测试
 - 覆盖: 本地映射、状态转换、签名逻辑、组包逻辑、错误码映射
 
 ## 契约测试
-- 覆盖: 请求结构与 openapi.yaml 一致、响应解析一致、枚举/字段类型/必填项
+- 覆盖: 请求结构与 openapi.yaml 一致
 
 ## 场景测试
-- 正常路径
-- 幂等场景
-- 失败场景
-- 超时与重试
-- 回调/查询竞态
-- 本地失败/渠道成功
-- 渠道错误码差异
+- 正常路径 / 幂等 / 失败 / 超时 / 重试 / 回调竞态 / 渠道错误码差异
 `,
   },
 ];
 
-const DOD_ITEMS = [
-  { itemKey: "spec_complete", label: "规范包齐全并已通过 GATE" },
-  { itemKey: "blocking_issues_closed", label: "所有阻塞性未决问题已关闭" },
-  { itemKey: "impl_complete", label: "实现代码完成" },
-  { itemKey: "unit_test_pass", label: "单元测试通过" },
-  { itemKey: "contract_test_pass", label: "契约测试通过" },
-  { itemKey: "scenario_test_pass", label: "场景测试通过" },
-  { itemKey: "exception_covered", label: "关键异常路径已覆盖" },
-  { itemKey: "runtime_rules_done", label: "runtime-rules 要求已落地" },
-  { itemKey: "observability_done", label: "observability 要求已落地" },
-  { itemKey: "integration_pass", label: "联调结果满足预期" },
-  { itemKey: "no_unapproved_assumptions", label: "未记录任何未经批准的实现假设" },
-];
-
-// ── GATE 检查逻辑（简化版，实际引用 spec-gate-service） ──
-
-function runGate1Check(files: SpecFile[]): any {
-  const errors: any[] = [];
-  const warnings: any[] = [];
-  const required = SPEC_TEMPLATES.map((t) => t.fileName);
-  const existing = new Set(files.map((f) => f.fileName));
-
-  for (const req of required) {
-    if (!existing.has(req)) errors.push({ file: req, message: `缺少必要文件: ${req}` });
-  }
-  for (const f of files) {
-    if (!f.content || f.content.trim().length === 0) {
-      errors.push({ file: f.fileName, message: `文件为空: ${f.fileName}` });
-    }
-    if (f.content) {
-      const lines = f.content.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (/TODO|TBD|PLACEHOLDER|待补充|待确认/i.test(line) && line.length < 100) {
-          errors.push({ file: f.fileName, field: `line ${i + 1}`, message: `占位内容: "${line}"` });
-        }
-      }
-    }
-  }
-
-  return { passed: errors.length === 0, checkedAt: new Date().toISOString(), errors, warnings };
+// ── Helper: 获取 companyId（从请求上下文） ──
+function resolveCompanyId(req: Request, fallback?: string): string {
+  const actor = (req as any).actor;
+  if (actor?.type === "agent" && actor.companyId) return actor.companyId;
+  if (actor?.type === "board" && actor.companyIds?.length === 1) return actor.companyIds[0];
+  if (fallback) return fallback;
+  return "";
 }
 
-function runGate2RuleCheck(files: SpecFile[]): any {
-  const errors: any[] = [];
-  const warnings: any[] = [];
-  const runtime = files.find((f) => f.templateType === "runtime_rules");
-  const observability = files.find((f) => f.templateType === "observability");
-  const scenarios = files.find((f) => f.templateType === "scenarios");
-
-  if (runtime?.content) {
-    for (const rule of ["timeout", "retry", "idempoten"]) {
-      if (!runtime.content.toLowerCase().includes(rule)) {
-        errors.push({ file: "04-runtime-rules.md", message: `缺少必要规则: ${rule}` });
-      }
-    }
-  }
-  if (observability?.content) {
-    if (!observability.content.toLowerCase().includes("trace")) {
-      warnings.push({ file: "05-observability.md", message: "未提及 traceId/链路追踪" });
-    }
-  }
-  if (scenarios?.content) {
-    for (const s of ["幂等", "超时", "重试", "回调"]) {
-      if (!scenarios.content.includes(s)) {
-        warnings.push({ file: "03-scenarios.md", message: `未覆盖场景: ${s}` });
-      }
-    }
-  }
-
-  return { passed: errors.length === 0, checkedAt: new Date().toISOString(), errors, warnings };
+// ── Helper: 获取 userId ──
+function resolveUserId(req: Request): string | null {
+  const actor = (req as any).actor;
+  return actor?.userId ?? actor?.actorId ?? null;
 }
 
-function runGate3Check(issues: SpecIssue[]): any {
-  const errors: any[] = [];
-  const warnings: any[] = [];
-  const blocking = issues.filter((i) => i.severity === "blocking" && !i.resolution);
-  for (const issue of blocking) {
-    errors.push({ message: `阻塞性问题未关闭: [${issue.issueType}] ${issue.title}` });
-  }
-  return { passed: errors.length === 0, checkedAt: new Date().toISOString(), errors, warnings };
+// ── Helper: files → gate check format ──
+function toGateFiles(files: Array<{ fileName: string; content: string | null; fileStatus: string; templateType: string; priority: number }>) {
+  return files;
 }
 
-function generateAgentCodingPrompt(files: SpecFile[]): string {
-  const map = new Map(files.map((f) => [f.templateType, f.content || ""]));
-  return `你是渠道对接开发者。严格根据以下规范文件实现，不要自行发明规则：
-1. glossary.md: ${map.get("glossary") || "缺失"}
-2. openapi.yaml: ${map.get("openapi") || "缺失"}
-3. flow.md: ${map.get("flow") || "缺失"}
-4. scenarios.md: ${map.get("scenarios") || "缺失"}
-5. runtime-rules.md: ${map.get("runtime_rules") || "缺失"}
-6. observability.md: ${map.get("observability") || "缺失"}
-7. testcases.md: ${map.get("testcases") || "缺失"}
-实现要求：术语以 glossary 为准，接口以 openapi 为准，运行时以 runtime-rules 为准，异常以 scenarios 为准，日志以 observability 为准，必须附带测试，遇到歧义先输出问题清单，不得补充未定义规则。`;
+// ── Helper: issues → gate3 format ──
+function toGate3Issues(issues: Array<{ id: string; issueType: string; source: string; severity: string; title: string; resolution: string | null }>) {
+  return issues.map((i) => ({
+    id: i.id,
+    issueType: i.issueType,
+    source: i.source,
+    severity: i.severity,
+    title: i.title,
+    resolution: i.resolution,
+  }));
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 路由
+// 路由工厂
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-export function createSpecRoutes(): Router {
+export function createSpecRoutes(db: Db): Router {
   const router = Router();
 
   // ── 规范包 CRUD ──
 
-  /** 创建规范包（为项目初始化 7 个模板文件） */
-  router.post("/api/projects/:projectId/spec-package", async (req, res) => {
-    const { projectId } = req.params;
-    const companyId = req.headers["x-company-id"] as string;
+  /** 创建规范包 */
+  router.post("/api/projects/:projectId/spec-package", async (req: Request, res) => {
+    const projectId = req.params.projectId as string;
+    const companyId = req.body.companyId || resolveCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "companyId required" });
+    assertCompanyAccess(req, companyId);
 
-    const pkg: SpecPackage = {
-      id: randomUUID(),
-      companyId,
-      projectId,
-      version: 1,
-      status: "draft",
-      gate1Status: "pending",
-      gate2Status: "pending",
-      gate3Status: "pending",
-      gate1Result: null,
-      gate2Result: null,
-      gate3Result: null,
-      approvedByUserId: null,
-      approvedAt: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    specPackages.set(pkg.id, pkg);
+    const existing = await db
+      .select()
+      .from(specPackages)
+      .where(and(eq(specPackages.projectId, projectId), eq(specPackages.companyId, companyId)))
+      .orderBy(desc(specPackages.version))
+      .limit(1);
 
-    // 创建 7 个模板文件
-    const files: SpecFile[] = SPEC_TEMPLATES.map((t) => ({
-      id: randomUUID(),
+    const version = existing.length > 0 ? existing[0].version + 1 : 1;
+
+    const [pkg] = await db
+      .insert(specPackages)
+      .values({ companyId, projectId, version, status: "draft" })
+      .returning();
+
+    const fileValues = SPEC_TEMPLATES.map((t) => ({
       specPackageId: pkg.id,
       companyId,
       templateType: t.templateType,
       fileName: t.fileName,
       content: t.template,
-      fileStatus: "draft",
+      fileStatus: "draft" as const,
       priority: t.priority,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
     }));
-    for (const f of files) specFiles.set(f.id, f);
+    const files = await db.insert(specFiles).values(fileValues).returning();
+
+    const dodValues = DOD_ITEMS.map((item) => ({
+      specPackageId: pkg.id,
+      companyId,
+      itemKey: item.itemKey,
+      label: item.label,
+    }));
+    await db.insert(specDODChecklist).values(dodValues);
 
     res.json({ specPackage: pkg, files });
   });
 
-  /** 获取规范包（含所有文件） */
-  router.get("/api/projects/:projectId/spec-package", async (req, res) => {
-    const { projectId } = req.params;
-    const companyId = req.headers["x-company-id"] as string;
+  /** 获取规范包 */
+  router.get("/api/projects/:projectId/spec-package", async (req: Request, res) => {
+    const projectId = req.params.projectId as string;
+    const companyId = (req.query.companyId as string) || resolveCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "companyId required" });
+    assertCompanyAccess(req, companyId);
 
-    const pkg = [...specPackages.values()].find(
-      (p) => p.projectId === projectId && p.companyId === companyId,
-    );
-    if (!pkg) return res.status(404).json({ error: "Spec package not found" });
+    const pkgRows = await db
+      .select()
+      .from(specPackages)
+      .where(and(eq(specPackages.projectId, projectId), eq(specPackages.companyId, companyId)))
+      .orderBy(desc(specPackages.version))
+      .limit(1);
 
-    const files = [...specFiles.values()].filter((f) => f.specPackageId === pkg.id);
-    const issues = [...specIssues.values()].filter((i) => i.specPackageId === pkg.id);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Spec package not found" });
+    const pkg = pkgRows[0];
 
-    res.json({ specPackage: pkg, files, issues });
+    const [files, issues, dod] = await Promise.all([
+      db.select().from(specFiles).where(eq(specFiles.specPackageId, pkg.id)),
+      db.select().from(specIssues).where(eq(specIssues.specPackageId, pkg.id)),
+      db.select().from(specDODChecklist).where(eq(specDODChecklist.specPackageId, pkg.id)),
+    ]);
+
+    res.json({ specPackage: pkg, files, issues, dod });
   });
 
-  /** 更新规范包文件内容 */
-  router.put("/api/spec-files/:fileId", async (req, res) => {
-    const { fileId } = req.params;
+  /** 更新规范包文件 */
+  router.put("/api/spec-files/:fileId", async (req: Request, res) => {
+    const fileId = req.params.fileId as string;
     const { content } = req.body;
 
-    const file = specFiles.get(fileId);
-    if (!file) return res.status(404).json({ error: "File not found" });
+    const fileRows = await db.select().from(specFiles).where(eq(specFiles.id, fileId)).limit(1);
+    if (fileRows.length === 0) return res.status(404).json({ error: "File not found" });
+    const file = fileRows[0];
 
-    file.content = content;
-    file.fileStatus = content && content.trim().length > 0 ? "complete" : "draft";
-    file.updatedAt = new Date().toISOString();
+    assertCompanyAccess(req, file.companyId);
 
-    // 重置 GATE 状态（规范包变更后需重新检查）
-    const pkg = specPackages.get(file.specPackageId);
-    if (pkg) {
-      pkg.gate1Status = "pending";
-      pkg.gate2Status = "pending";
-      pkg.updatedAt = new Date().toISOString();
-      specPackages.set(pkg.id, pkg);
-    }
+    const [updated] = await db
+      .update(specFiles)
+      .set({
+        content,
+        fileStatus: content && content.trim().length > 0 ? "complete" : "draft",
+        updatedAt: new Date(),
+      })
+      .where(eq(specFiles.id, fileId))
+      .returning();
 
-    res.json(file);
+    await db
+      .update(specPackages)
+      .set({ gate1Status: "pending", gate2Status: "pending", updatedAt: new Date() })
+      .where(eq(specPackages.id, file.specPackageId));
+
+    res.json(updated);
   });
 
   // ── GATE 检查 ──
 
   /** GATE-1：完整性检查 */
-  router.post("/api/spec-packages/:pkgId/gate/1", async (req, res) => {
-    const { pkgId } = req.params;
-    const pkg = specPackages.get(pkgId);
-    if (!pkg) return res.status(404).json({ error: "Spec package not found" });
+  router.post("/api/spec-packages/:pkgId/gate/1", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    const pkg = pkgRows[0];
+    assertCompanyAccess(req, pkg.companyId);
 
-    const files = [...specFiles.values()].filter((f) => f.specPackageId === pkgId);
-    const result = runGate1Check(files);
+    const fileRows = await db.select().from(specFiles).where(eq(specFiles.specPackageId, pkgId));
+    const result = runGate1Check(toGateFiles(fileRows));
 
-    pkg.gate1Status = result.passed ? "passed" : "failed";
-    pkg.gate1Result = result;
-    pkg.updatedAt = new Date().toISOString();
-    specPackages.set(pkgId, pkg);
+    if (!result.passed) {
+      for (const err of result.errors) {
+        if (err.message.includes("缺少必要文件")) {
+          await db.insert(specIssues).values({
+            specPackageId: pkgId, companyId: pkg.companyId,
+            issueType: "spec_gap", source: "gate1", severity: "blocking", title: err.message,
+          });
+        }
+      }
+    }
 
-    res.json({ gate: "GATE-1", result });
+    const [updated] = await db
+      .update(specPackages)
+      .set({ gate1Status: result.passed ? "passed" : "failed", gate1Result: result as any, updatedAt: new Date() })
+      .where(eq(specPackages.id, pkgId))
+      .returning();
+
+    res.json({ gate: "GATE-1", result, specPackage: updated });
   });
 
   /** GATE-2：一致性检查 */
-  router.post("/api/spec-packages/:pkgId/gate/2", async (req, res) => {
-    const { pkgId } = req.params;
-    const pkg = specPackages.get(pkgId);
-    if (!pkg) return res.status(404).json({ error: "Spec package not found" });
+  router.post("/api/spec-packages/:pkgId/gate/2", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    const pkg = pkgRows[0];
+    assertCompanyAccess(req, pkg.companyId);
 
-    const files = [...specFiles.values()].filter((f) => f.specPackageId === pkgId);
-    const result = runGate2RuleCheck(files);
+    if (pkg.gate1Status !== "passed") {
+      return res.status(400).json({ error: "GATE-1 must pass first", gate1Status: pkg.gate1Status });
+    }
 
-    pkg.gate2Status = result.passed ? "passed" : "failed";
-    pkg.gate2Result = result;
-    pkg.updatedAt = new Date().toISOString();
-    specPackages.set(pkgId, pkg);
+    const fileRows = await db.select().from(specFiles).where(eq(specFiles.specPackageId, pkgId));
+    const result = runGate2RuleCheck(toGateFiles(fileRows));
 
-    res.json({ gate: "GATE-2", result });
+    for (const item of [...result.errors, ...result.warnings]) {
+      await db.insert(specIssues).values({
+        specPackageId: pkgId, companyId: pkg.companyId,
+        issueType: item.message.includes("冲突") ? "conflict" : "missing_coverage",
+        source: "gate2", severity: result.errors.includes(item) ? "blocking" : "warning",
+        title: item.message, relatedFiles: item.file ? [item.file] : null,
+      });
+    }
+
+    const [updated] = await db
+      .update(specPackages)
+      .set({ gate2Status: result.passed ? "passed" : "failed", gate2Result: result as any, updatedAt: new Date() })
+      .where(eq(specPackages.id, pkgId))
+      .returning();
+
+    res.json({ gate: "GATE-2", result, specPackage: updated });
   });
 
   /** GATE-3：未决问题检查 */
-  router.post("/api/spec-packages/:pkgId/gate/3", async (req, res) => {
-    const { pkgId } = req.params;
-    const pkg = specPackages.get(pkgId);
-    if (!pkg) return res.status(404).json({ error: "Spec package not found" });
+  router.post("/api/spec-packages/:pkgId/gate/3", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    const pkg = pkgRows[0];
+    assertCompanyAccess(req, pkg.companyId);
 
-    const issues = [...specIssues.values()].filter((i) => i.specPackageId === pkgId);
-    const result = runGate3Check(issues);
+    if (pkg.gate2Status !== "passed") {
+      return res.status(400).json({ error: "GATE-2 must pass first", gate2Status: pkg.gate2Status });
+    }
 
-    pkg.gate3Status = result.passed ? "passed" : "failed";
-    pkg.gate3Result = result;
-    pkg.updatedAt = new Date().toISOString();
-    specPackages.set(pkgId, pkg);
+    const issueRows = await db.select().from(specIssues).where(eq(specIssues.specPackageId, pkgId));
+    const result = runGate3Check(toGate3Issues(issueRows));
 
-    res.json({ gate: "GATE-3", result });
+    const [updated] = await db
+      .update(specPackages)
+      .set({
+        gate3Status: result.passed ? "passed" : "failed",
+        gate3Result: result as any,
+        status: result.passed ? "approved" : "review",
+        approvedAt: result.passed ? new Date() : null,
+        updatedAt: new Date(),
+      })
+      .where(eq(specPackages.id, pkgId))
+      .returning();
+
+    res.json({ gate: "GATE-3", result, specPackage: updated });
   });
 
   /** 一键执行所有 GATE */
-  router.post("/api/spec-packages/:pkgId/gate/all", async (req, res) => {
-    const { pkgId } = req.params;
-    const pkg = specPackages.get(pkgId);
-    if (!pkg) return res.status(404).json({ error: "Spec package not found" });
+  router.post("/api/spec-packages/:pkgId/gate/all", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    const pkg = pkgRows[0];
+    assertCompanyAccess(req, pkg.companyId);
 
-    const files = [...specFiles.values()].filter((f) => f.specPackageId === pkgId);
-    const issues = [...specIssues.values()].filter((i) => i.specPackageId === pkgId);
+    const fileRows = await db.select().from(specFiles).where(eq(specFiles.specPackageId, pkgId));
+    const issueRows = await db.select().from(specIssues).where(eq(specIssues.specPackageId, pkgId));
 
-    const gate1 = runGate1Check(files);
-    const gate2 = gate1.passed ? runGate2RuleCheck(files) : { passed: false, checkedAt: new Date().toISOString(), errors: [{ message: "GATE-1 未通过，跳过 GATE-2" }], warnings: [] };
-    const gate3 = gate2.passed ? runGate3Check(issues) : { passed: false, checkedAt: new Date().toISOString(), errors: [{ message: "GATE-2 未通过，跳过 GATE-3" }], warnings: [] };
+    const gate1 = runGate1Check(toGateFiles(fileRows));
 
-    pkg.gate1Status = gate1.passed ? "passed" : "failed";
-    pkg.gate2Status = gate2.passed ? "passed" : "failed";
-    pkg.gate3Status = gate3.passed ? "passed" : "failed";
-    pkg.gate1Result = gate1;
-    pkg.gate2Result = gate2;
-    pkg.gate3Result = gate3;
-    pkg.updatedAt = new Date().toISOString();
+    const gate2: GateCheckResult = gate1.passed
+      ? runGate2RuleCheck(toGateFiles(fileRows))
+      : { passed: false, checkedAt: new Date().toISOString(), errors: [{ message: "GATE-1 未通过" }], warnings: [] };
 
-    if (gate1.passed && gate2.passed && gate3.passed) {
-      pkg.status = "approved";
+    const gate3: GateCheckResult = gate2.passed
+      ? runGate3Check(toGate3Issues(issueRows))
+      : { passed: false, checkedAt: new Date().toISOString(), errors: [{ message: "GATE-2 未通过" }], warnings: [] };
+
+    const overallPassed = gate1.passed && gate2.passed && gate3.passed;
+
+    if (!gate1.passed) {
+      for (const err of gate1.errors) {
+        await db.insert(specIssues).values({
+          specPackageId: pkgId, companyId: pkg.companyId,
+          issueType: "spec_gap", source: "gate1", severity: "blocking", title: err.message,
+        });
+      }
     }
 
-    specPackages.set(pkgId, pkg);
+    const [updated] = await db
+      .update(specPackages)
+      .set({
+        gate1Status: gate1.passed ? "passed" : "failed",
+        gate2Status: gate2.passed ? "passed" : "failed",
+        gate3Status: gate3.passed ? "passed" : "failed",
+        gate1Result: gate1 as any,
+        gate2Result: gate2 as any,
+        gate3Result: gate3 as any,
+        status: overallPassed ? "approved" : "review",
+        approvedAt: overallPassed ? new Date() : null,
+        updatedAt: new Date(),
+      })
+      .where(eq(specPackages.id, pkgId))
+      .returning();
 
-    res.json({
-      overallPassed: gate1.passed && gate2.passed && gate3.passed,
-      gate1,
-      gate2,
-      gate3,
-    });
+    res.json({ overallPassed, gate1, gate2, gate3, specPackage: updated });
   });
 
-  // ── 未决问题管理 ──
+  // ── 问题管理 ──
 
-  /** 创建问题（GATE 检查自动或手动创建） */
-  router.post("/api/spec-packages/:pkgId/issues", async (req, res) => {
-    const { pkgId } = req.params;
+  router.post("/api/spec-packages/:pkgId/issues", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    assertCompanyAccess(req, pkgRows[0].companyId);
+
     const { issueType, source, severity, title, description, suggestion, relatedFiles } = req.body;
-    const companyId = req.headers["x-company-id"] as string;
+    const [issue] = await db.insert(specIssues).values({
+      specPackageId: pkgId, companyId: pkgRows[0].companyId,
+      issueType, source, severity: severity || "blocking",
+      relatedFiles: relatedFiles || null, title,
+      description: description || null, suggestion: suggestion || null,
+    }).returning();
 
-    const issue: SpecIssue = {
-      id: randomUUID(),
-      specPackageId: pkgId,
-      companyId,
-      issueType,
-      source,
-      severity: severity || "blocking",
-      relatedFiles: relatedFiles || null,
-      title,
-      description: description || null,
-      suggestion: suggestion || null,
-      resolution: null,
-      resolutionNote: null,
-      resolvedByUserId: null,
-      resolvedAt: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    specIssues.set(issue.id, issue);
     res.json(issue);
   });
 
-  /** 解决问题 */
-  router.put("/api/spec-issues/:issueId/resolve", async (req, res) => {
-    const { issueId } = req.params;
+  router.put("/api/spec-issues/:issueId/resolve", async (req: Request, res) => {
+    const issueId = req.params.issueId as string;
     const { resolution, resolutionNote } = req.body;
-    const userId = req.headers["x-user-id"] as string;
+    const issueRows = await db.select().from(specIssues).where(eq(specIssues.id, issueId)).limit(1);
+    if (issueRows.length === 0) return res.status(404).json({ error: "Not found" });
+    assertCompanyAccess(req, issueRows[0].companyId);
 
-    const issue = specIssues.get(issueId);
-    if (!issue) return res.status(404).json({ error: "Issue not found" });
+    const [updated] = await db.update(specIssues).set({
+      resolution, resolutionNote: resolutionNote || null,
+      resolvedByUserId: resolveUserId(req), resolvedAt: new Date(), updatedAt: new Date(),
+    }).where(eq(specIssues.id, issueId)).returning();
 
-    issue.resolution = resolution;
-    issue.resolutionNote = resolutionNote || null;
-    issue.resolvedByUserId = userId || null;
-    issue.resolvedAt = new Date().toISOString();
-    issue.updatedAt = new Date().toISOString();
-    specIssues.set(issueId, issue);
+    res.json(updated);
+  });
 
-    res.json(issue);
+  router.get("/api/spec-packages/:pkgId/issues", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    assertCompanyAccess(req, pkgRows[0].companyId);
+
+    const issues = await db.select().from(specIssues).where(eq(specIssues.specPackageId, pkgId));
+    res.json(issues);
   });
 
   // ── AI Agent 编码约束 ──
 
-  /** 生成 AI Agent 编码约束提示词 */
-  router.get("/api/spec-packages/:pkgId/agent-prompt", async (req, res) => {
-    const { pkgId } = req.params;
-    const pkg = specPackages.get(pkgId);
-    if (!pkg) return res.status(404).json({ error: "Spec package not found" });
+  router.get("/api/spec-packages/:pkgId/agent-prompt", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    const pkg = pkgRows[0];
+    assertCompanyAccess(req, pkg.companyId);
 
-    // 只有 approved 状态才能生成
     if (pkg.status !== "approved") {
-      return res.status(400).json({ error: "Spec package must be approved before generating agent prompt" });
+      return res.status(400).json({ error: "Spec package must be approved", currentStatus: pkg.status });
     }
 
-    const files = [...specFiles.values()].filter((f) => f.specPackageId === pkgId);
-    const prompt = generateAgentCodingPrompt(files);
-
-    res.json({ prompt, specPackageId: pkgId });
+    const fileRows = await db.select().from(specFiles).where(eq(specFiles.specPackageId, pkgId));
+    const prompt = generateAgentCodingPrompt(toGateFiles(fileRows));
+    res.json({ prompt, specPackageId: pkgId, version: pkg.version });
   });
 
   // ── DoD 检查清单 ──
 
-  /** 获取 DoD 检查清单 */
-  router.get("/api/spec-packages/:pkgId/dod", async (req, res) => {
-    const { pkgId } = req.params;
-    res.json({ items: DOD_ITEMS, specPackageId: pkgId });
+  router.get("/api/spec-packages/:pkgId/dod", async (req: Request, res) => {
+    const pkgId = req.params.pkgId as string;
+    const pkgRows = await db.select().from(specPackages).where(eq(specPackages.id, pkgId)).limit(1);
+    if (pkgRows.length === 0) return res.status(404).json({ error: "Not found" });
+    assertCompanyAccess(req, pkgRows[0].companyId);
+
+    const dod = await db.select().from(specDODChecklist).where(eq(specDODChecklist.specPackageId, pkgId));
+    res.json({ items: dod, specPackageId: pkgId });
+  });
+
+  router.put("/api/spec-dod/:dodId/toggle", async (req: Request, res) => {
+    const dodId = req.params.dodId as string;
+    const dodRows = await db.select().from(specDODChecklist).where(eq(specDODChecklist.id, dodId)).limit(1);
+    if (dodRows.length === 0) return res.status(404).json({ error: "Not found" });
+    assertCompanyAccess(req, dodRows[0].companyId);
+
+    const newChecked = dodRows[0].checked ? 0 : 1;
+    const [updated] = await db.update(specDODChecklist).set({
+      checked: newChecked, checkedByUserId: resolveUserId(req),
+      checkedAt: newChecked ? new Date() : null, updatedAt: new Date(),
+    }).where(eq(specDODChecklist.id, dodId)).returning();
+
+    res.json(updated);
   });
 
   return router;
 }
 
-export { SPEC_TEMPLATES, DOD_ITEMS };
+export { SPEC_TEMPLATES };
