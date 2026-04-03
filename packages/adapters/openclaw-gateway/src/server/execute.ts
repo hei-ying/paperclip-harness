@@ -1066,11 +1066,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const templateMessage = nonEmpty(payloadTemplate.message) ?? nonEmpty(payloadTemplate.text);
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
+
+  // ── Spec Package Injection: 注入渠道对接规范包约束到 message 前缀 ──
+  const specPackagePrompt = nonEmpty(ctx.context.specPackagePrompt);
+  const finalMessage = specPackagePrompt
+    ? `${specPackagePrompt}\n\n---\n\n${message}`
+    : message;
+
   const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
 
   const agentParams: Record<string, unknown> = {
     ...payloadTemplate,
-    message,
+    message: finalMessage,
     sessionKey,
     idempotencyKey: ctx.runId,
   };

@@ -16,6 +16,8 @@ import {
   projects,
   projectWorkspaces,
 } from "@paperclipai/db";
+import { specPackages, specFiles } from "@paperclipai/db";
+import { generateAgentCodingPrompt } from "./spec-gate-service.js";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
@@ -2647,6 +2649,30 @@ export function heartbeatService(db: Db) {
           payload: meta as unknown as Record<string, unknown>,
         });
       };
+
+      // ── Spec Package Injection: 注入渠道对接规范包约束 ──
+      const contextProjectId = readNonEmptyString(context.projectId);
+      if (contextProjectId) {
+        try {
+          const { prepareSpecInjection } = await import("./spec-injection.js");
+          const specPkg = await db.query.specPackages.findFirst({
+            where: and(eq(specPackages.projectId, contextProjectId), eq(specPackages.companyId, agent.companyId), eq(specPackages.status, "approved")),
+            orderBy: [desc(specPackages.version)],
+          });
+          if (specPkg) {
+            const specFileRows = await db.select().from(specFiles).where(eq(specFiles.specPackageId, specPkg.id));
+            const prompt = generateAgentCodingPrompt(specFileRows.map((f) => ({
+              fileName: f.fileName, content: f.content, fileStatus: f.fileStatus,
+              templateType: f.templateType, priority: f.priority,
+            })));
+            context.specPackagePrompt = prompt;
+            context.specPackageId = specPkg.id;
+            context.specPackageVersion = specPkg.version;
+          }
+        } catch (specErr) {
+          logger.warn({ err: specErr, projectId: contextProjectId }, "spec package injection failed (non-blocking)");
+        }
+      }
 
       const adapter = getServerAdapter(agent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt

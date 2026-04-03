@@ -404,9 +404,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+
+  // ── Spec Package Injection: 渠道对接规范包约束 ──
+  const specPackagePrompt = asString(context.specPackagePrompt, "").trim();
+  const specSections = specPackagePrompt ? [specPackagePrompt] : [];
+
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
     sessionHandoffNote,
+    ...specSections,
     renderedPrompt,
   ]);
   const promptMetrics = {
