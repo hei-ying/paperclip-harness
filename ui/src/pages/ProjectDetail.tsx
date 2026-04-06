@@ -33,10 +33,11 @@ import { PluginLauncherOutlet } from "@/plugins/launchers";
 import { PluginSlotMount, PluginSlotOutlet, usePluginSlots } from "@/plugins/slots";
 import { Copy, FolderOpen, GitBranch, Loader2, Play, Square } from "lucide-react";
 import { IssuesQuicklook } from "../components/IssuesQuicklook";
+import { SpecPackagePanel } from "../components/SpecPackagePanel";
 
 /* ── Top-level tab types ── */
 
-type ProjectBaseTab = "overview" | "list" | "workspaces" | "configuration" | "budget";
+type ProjectBaseTab = "overview" | "list" | "workspaces" | "configuration" | "budget" | "spec";
 type ProjectPluginTab = `plugin:${string}`;
 type ProjectTab = ProjectBaseTab | ProjectPluginTab;
 
@@ -54,6 +55,7 @@ function resolveProjectTab(pathname: string, projectId: string): ProjectTab | nu
   if (tab === "budget") return "budget";
   if (tab === "issues") return "list";
   if (tab === "workspaces") return "workspaces";
+  if (tab === "spec") return "spec";
   return null;
 }
 
@@ -786,6 +788,8 @@ export function ProjectDetail() {
       navigate(`/projects/${canonicalProjectRef}/budget`);
     } else if (tab === "configuration") {
       navigate(`/projects/${canonicalProjectRef}/configuration`);
+    } else if (tab === "spec") {
+      navigate(`/projects/${canonicalProjectRef}/spec`);
     } else {
       navigate(`/projects/${canonicalProjectRef}/issues`);
     }
@@ -855,6 +859,7 @@ export function ProjectDetail() {
             ...(showWorkspacesTab ? [{ value: "workspaces", label: "Workspaces" }] : []),
             { value: "configuration", label: "Configuration" },
             { value: "budget", label: "Budget" },
+            { value: "spec", label: "Spec Package" },
             ...pluginTabItems.map((item) => ({
               value: item.value,
               label: item.label,
@@ -921,6 +926,10 @@ export function ProjectDetail() {
           />
         </div>
       ) : null}
+
+      {activeTab === "spec" && project?.id && (
+        <SpecPackagePanel projectId={project.id} companyId={resolvedCompanyId ?? undefined} />
+      )}
 
       {activePluginTab && (
         <PluginSlotMount
